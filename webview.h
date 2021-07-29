@@ -34,16 +34,29 @@ extern "C" {
 
 typedef void *webview_t;
 
-// Creates a new webview instance. If debug is non-zero - developer tools will
-// be enabled (if the platform supports them). Window parameter can be a
-// pointer to the native window handle. If it's non-null - then child WebView
-// is embedded into the given parent window. Otherwise a new window is created.
+// Creates a new webview instance. Window parameter can be a pointer to the 
+// native window handle. If it's non-null - then child WebView will be embedded 
+// into the given parent window. Otherwise a new window will be created.
 // Depending on the platform, a GtkWindow, NSWindow or HWND pointer can be
 // passed here.
-WEBVIEW_API webview_t webview_create(int debug, void *window);
+WEBVIEW_API webview_t webview_create(void *window);
 
 // Destroys a webview and closes the native window.
 WEBVIEW_API void webview_destroy(webview_t w);
+
+// Returns non-zero if webview_addview and subsequent webview calls need to 
+// happen on the same thread where webview_run will be called. 
+WEBVIEW_API int webview_init_in_run_thread(webview_t w);
+
+// Adds a hidden webview to the window. If debug is non-zero - developer tools will
+// be enabled (if the platform supports them).
+WEBVIEW_API void webview_addview(webview_t w, int debug);
+
+// Shows the webview window.
+WEBVIEW_API void webview_show(webview_t w, int hide_on_close);
+
+// Hides the webview window.
+WEBVIEW_API void webview_hide(webview_t w);
 
 // Runs the main loop until it's terminated. After this function exits - you
 // must destroy the webview.
@@ -439,53 +452,68 @@ inline std::string json_parse(const std::string s, const std::string key,
 #include <JavaScriptCore/JavaScript.h>
 #include <gtk/gtk.h>
 #include <webkit2/webkit2.h>
+#include <X11/Xlib.h>
 
 namespace webview {
 
 class gtk_webkit_engine {
 public:
-  gtk_webkit_engine(bool debug, void *window)
+  gtk_webkit_engine(void *window)
       : m_window(static_cast<GtkWidget *>(window)) {
+  }
+
+  int init_in_run_thread() {
+    return false;
+  }
+
+  void add_view(bool debug) {
+    XInitThreads();
     gtk_init_check(0, NULL);
-    m_window = static_cast<GtkWidget *>(window);
+    m_window = static_cast<GtkWidget *>(m_window);
     if (m_window == nullptr) {
       m_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     }
     g_signal_connect(G_OBJECT(m_window), "destroy",
-                     G_CALLBACK(+[](GtkWidget *, gpointer arg) {
-                       static_cast<gtk_webkit_engine *>(arg)->terminate();
-                     }),
-                     this);
+                    G_CALLBACK(+[](GtkWidget *, gpointer arg) {
+                      static_cast<gtk_webkit_engine *>(arg)->terminate();
+                    }),
+                    this);
+    g_signal_connect(G_OBJECT(m_window), "delete-event",
+                    G_CALLBACK(+[](GtkWidget *, GdkEvent  *, gpointer arg) -> gboolean {
+                      return static_cast<gtk_webkit_engine *>(arg)->on_window_close();
+                    }),
+                    this);
+
     // Initialize webview widget
     m_webview = webkit_web_view_new();
     WebKitUserContentManager *manager =
         webkit_web_view_get_user_content_manager(WEBKIT_WEB_VIEW(m_webview));
     g_signal_connect(manager, "script-message-received::external",
-                     G_CALLBACK(+[](WebKitUserContentManager *,
+                    G_CALLBACK(+[](WebKitUserContentManager *,
                                     WebKitJavascriptResult *r, gpointer arg) {
-                       auto *w = static_cast<gtk_webkit_engine *>(arg);
+                      auto *w = static_cast<gtk_webkit_engine *>(arg);
 #if WEBKIT_MAJOR_VERSION >= 2 && WEBKIT_MINOR_VERSION >= 22
-                       JSCValue *value =
-                           webkit_javascript_result_get_js_value(r);
-                       char *s = jsc_value_to_string(value);
+                      JSCValue *value =
+                          webkit_javascript_result_get_js_value(r);
+                      char *s = jsc_value_to_string(value);
 #else
-                       JSGlobalContextRef ctx =
-                           webkit_javascript_result_get_global_context(r);
-                       JSValueRef value = webkit_javascript_result_get_value(r);
-                       JSStringRef js = JSValueToStringCopy(ctx, value, NULL);
-                       size_t n = JSStringGetMaximumUTF8CStringSize(js);
-                       char *s = g_new(char, n);
-                       JSStringGetUTF8CString(js, s, n);
-                       JSStringRelease(js);
+                      JSGlobalContextRef ctx =
+                          webkit_javascript_result_get_global_context(r);
+                      JSValueRef value = webkit_javascript_result_get_value(r);
+                      JSStringRef js = JSValueToStringCopy(ctx, value, NULL);
+                      size_t n = JSStringGetMaximumUTF8CStringSize(js);
+                      char *s = g_new(char, n);
+                      JSStringGetUTF8CString(js, s, n);
+                      JSStringRelease(js);
 #endif
-                       w->on_message(s);
-                       g_free(s);
-                     }),
-                     this);
+                      w->on_message(s);
+                      g_free(s);
+                    }),
+                    this);
     webkit_user_content_manager_register_script_message_handler(manager,
                                                                 "external");
     init("window.external={invoke:function(s){window.webkit.messageHandlers."
-         "external.postMessage(s);}}");
+        "external.postMessage(s);}}");
 
     gtk_container_add(GTK_CONTAINER(m_window), GTK_WIDGET(m_webview));
     gtk_widget_grab_focus(GTK_WIDGET(m_webview));
@@ -498,9 +526,10 @@ public:
                                                                   true);
       webkit_settings_set_enable_developer_extras(settings, true);
     }
-
-    gtk_widget_show_all(m_window);
   }
+
+  void show(bool hide_on_close) { m_hide_on_close = hide_on_close; gtk_widget_show_all(m_window); }
+  void hide() { gtk_widget_hide(m_window); }
   void *window() { return (void *)m_window; }
   void run() { gtk_main(); }
   void terminate() { gtk_main_quit(); }
@@ -540,20 +569,30 @@ public:
 
   void init(const std::string js) {
     WebKitUserContentManager *manager =
-        webkit_web_view_get_user_content_manager(WEBKIT_WEB_VIEW(m_webview));
+        webkit_web_view_get_user_content_manager(
+            WEBKIT_WEB_VIEW(m_webview));
     webkit_user_content_manager_add_script(
-        manager, webkit_user_script_new(
-                     js.c_str(), WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
-                     WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL));
+        manager,
+        webkit_user_script_new(
+            js.c_str(), WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+            WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL,
+            NULL));
   }
 
   void eval(const std::string js) {
-    webkit_web_view_run_javascript(WEBKIT_WEB_VIEW(m_webview), js.c_str(), NULL,
-                                   NULL, NULL);
+    webkit_web_view_run_javascript(WEBKIT_WEB_VIEW(m_webview), js.c_str(), NULL, NULL, NULL);
   }
 
 private:
+  gboolean on_window_close() {
+    if (m_hide_on_close) {
+      return gtk_widget_hide_on_delete(m_window);
+    }
+    return FALSE;
+  }
+
   virtual void on_message(const std::string msg) = 0;
+  bool m_hide_on_close;
   GtkWidget *m_window;
   GtkWidget *m_webview;
 };
@@ -600,7 +639,13 @@ id operator"" _str(const char *s, std::size_t) {
 
 class cocoa_wkwebview_engine {
 public:
-  cocoa_wkwebview_engine(bool debug, void *window) {
+  cocoa_wkwebview_engine(void *window) : m_window(static_cast<id>(window)){}
+
+  int init_in_run_thread() {
+    return true;
+  }
+
+  void add_view(bool debug) {
     // Application
     id app = ((id(*)(id, SEL))objc_msgSend)("NSApplication"_cls,
                                             "sharedApplication"_sel);
@@ -633,14 +678,12 @@ public:
                                           delegate);
 
     // Main window
-    if (window == nullptr) {
+    if (m_window == nullptr) {
       m_window = ((id(*)(id, SEL))objc_msgSend)("NSWindow"_cls, "alloc"_sel);
       m_window =
           ((id(*)(id, SEL, CGRect, int, unsigned long, int))objc_msgSend)(
               m_window, "initWithContentRect:styleMask:backing:defer:"_sel,
               CGRectMake(0, 0, 0, 0), 0, NSBackingStoreBuffered, 0);
-    } else {
-      m_window = (id)window;
     }
 
     // Webview
@@ -708,6 +751,15 @@ public:
                                           nullptr);
   }
   ~cocoa_wkwebview_engine() { close(); }
+
+  // implementation details references:
+  //   https://developer.apple.com/documentation/appkit/nsapplication/app_windows
+  //   https://developer.apple.com/documentation/appkit/nsapplication/1428733-hide
+  //   http://www.knowstack.com/cocoa-delegate-design-pattern/
+  //   https://medium.com/@venj/hide-window-instead-of-close-it-when-clicks-the-close-button-25768e41ee2d
+  void show(bool hide_on_close) { /* TODO: implement for Mac */ }
+  void hide() { /* TODO: implement for Mac */ }  
+
   void *window() { return (void *)m_window; }
   void terminate() {
     close();
@@ -928,7 +980,7 @@ private:
 class edge_chromium : public browser {
 public:
   bool embed(HWND wnd, bool debug, msg_cb_t cb) override {
-    CoInitializeEx(nullptr, 0);
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     std::atomic_flag flag = ATOMIC_FLAG_INIT;
     flag.test_and_set();
 
@@ -1068,8 +1120,15 @@ private:
 
 class win32_edge_engine {
 public:
-  win32_edge_engine(bool debug, void *window) {
-    if (window == nullptr) {
+  win32_edge_engine(void *window) 
+    : m_window(static_cast<HWND>(window)) {}
+
+  int init_in_run_thread() {
+    return true;
+  }
+
+  void add_view(bool debug) {
+    if (m_window == nullptr) {
       HINSTANCE hInstance = GetModuleHandle(nullptr);
       HICON icon = (HICON)LoadImage(
           hInstance, IDI_APPLICATION, IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
@@ -1090,7 +1149,12 @@ public:
               w->m_browser->resize(hwnd);
               break;
             case WM_CLOSE:
-              DestroyWindow(hwnd);
+              if (w->m_hide_on_close) {
+                w->hide();
+              }
+              else {
+                DestroyWindow(hwnd);
+              }            
               break;
             case WM_DESTROY:
               w->terminate();
@@ -1114,18 +1178,23 @@ public:
             return 0;
           });
       RegisterClassEx(&wc);
-      m_window = CreateWindow("webview", "", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
+      m_window = CreateWindowEx(WS_EX_TOOLWINDOW, "webview", "", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
                               CW_USEDEFAULT, 640, 480, nullptr, nullptr,
                               GetModuleHandle(nullptr), nullptr);
       SetWindowLongPtr(m_window, GWLP_USERDATA, (LONG_PTR)this);
-    } else {
-      m_window = *(static_cast<HWND *>(window));
     }
 
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
+
+    // move off screen
+    RECT desktop, thisw;
+    GetWindowRect(GetDesktopWindow(), &desktop);
+    GetClientRect(m_window, &thisw);
+    SetWindowPos(m_window, nullptr, desktop.right, desktop.bottom, thisw.right, thisw.bottom, 0);
+
+    // the window needs to be shown on screen while browser->embed is happenning for the webview
+    // component to show up properly inside the window.
     ShowWindow(m_window, SW_SHOW);
-    UpdateWindow(m_window);
-    SetFocus(m_window);
 
     auto cb =
         std::bind(&win32_edge_engine::on_message, this, std::placeholders::_1);
@@ -1136,9 +1205,17 @@ public:
     }
 
     m_browser->resize(m_window);
+    this->hide();
+
+    // switch back to overlapped
+    long style = GetWindowLong(m_window, GWL_EXSTYLE);
+    style &= ~WS_EX_TOOLWINDOW;
+    SetWindowLong(m_window, GWL_EXSTYLE, style);
   }
 
   void run() {
+    m_main_thread = GetCurrentThreadId();
+
     MSG msg;
     BOOL res;
     while ((res = GetMessage(&msg, nullptr, 0, 0)) != -1) {
@@ -1156,6 +1233,15 @@ public:
       }
     }
   }
+  void show(bool hide_on_close) { 
+    center_on_screen();
+
+    m_hide_on_close = hide_on_close; 
+    ShowWindow(m_window, SW_SHOW);
+    UpdateWindow(m_window);
+    SetFocus(m_window);
+  }
+  void hide() { ShowWindow(m_window, SW_HIDE); }
   void *window() { return (void *)m_window; }
   void terminate() { PostQuitMessage(0); }
   void dispatch(dispatch_fn_t f) {
@@ -1188,7 +1274,7 @@ public:
       r.bottom = height;
       AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, 0);
       SetWindowPos(
-          m_window, NULL, r.left, r.top, r.right - r.left, r.bottom - r.top,
+          m_window, nullptr, r.left, r.top, r.right - r.left, r.bottom - r.top,
           SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_FRAMECHANGED);
       m_browser->resize(m_window);
     }
@@ -1201,6 +1287,27 @@ public:
 private:
   virtual void on_message(const std::string msg) = 0;
 
+  void center_on_screen() {
+    int nWidth = GetSystemMetrics(SM_CXSCREEN);
+    int nHeight = GetSystemMetrics(SM_CYSCREEN);
+    RECT thisw;
+    GetWindowRect(m_window, &thisw);
+
+    int width = thisw.right - thisw.left;
+    int height = thisw.bottom - thisw.top;
+
+    int xPos = (nWidth - width) / 2;
+    int yPos = (nHeight - height) / 2;
+
+    // keep within the desktop
+    if (xPos < 0) xPos = 0;
+    if (yPos < 0) yPos = 0;
+    if (xPos + width > nWidth)   xPos = nWidth - width;
+    if (yPos + height > nHeight) yPos = nHeight - height;
+    SetWindowPos(m_window, nullptr, xPos, yPos, width, height, 0);
+  }
+
+  bool m_hide_on_close;
   HWND m_window;
   POINT m_minsz = POINT{0, 0};
   POINT m_maxsz = POINT{0, 0};
@@ -1218,8 +1325,8 @@ namespace webview {
 
 class webview : public browser_engine {
 public:
-  webview(bool debug = false, void *wnd = nullptr)
-      : browser_engine(debug, wnd) {}
+  webview(void *wnd = nullptr)
+      : browser_engine(wnd) {}
 
   void navigate(const std::string url) {
     if (url == "") {
@@ -1301,12 +1408,30 @@ private:
 };
 } // namespace webview
 
-WEBVIEW_API webview_t webview_create(int debug, void *wnd) {
-  return new webview::webview(debug, wnd);
+
+
+WEBVIEW_API webview_t webview_create(void *wnd) {
+  return new webview::webview(wnd);
 }
 
 WEBVIEW_API void webview_destroy(webview_t w) {
   delete static_cast<webview::webview *>(w);
+}
+
+WEBVIEW_API int webview_init_in_run_thread(webview_t w) {
+  return static_cast<webview::webview *>(w)->init_in_run_thread();
+}
+
+WEBVIEW_API void webview_addview(webview_t w, int debug) {
+  static_cast<webview::webview *>(w)->add_view(debug);
+}
+
+WEBVIEW_API void webview_show(webview_t w, int hide_on_close) {
+  static_cast<webview::webview *>(w)->show(hide_on_close);
+}
+
+WEBVIEW_API void webview_hide(webview_t w) {
+  static_cast<webview::webview *>(w)->hide();
 }
 
 WEBVIEW_API void webview_run(webview_t w) {
